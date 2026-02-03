@@ -84,7 +84,7 @@ def analyze():
 
     # 4) Prototype logic (placeholder)
     blob = (text or url).lower()
-    suspicious = any(k in blob for k in ["urgent", "verify", "password", "account", "invoice", "payment", "login"])
+    suspicious = any(k in blob for k in ["urgent","quick","money","transaction", "verify", "password", "account", "invoice", "payment", "login"])
 
     verdict = "Suspicious" if suspicious else "Safe"
     risk = 0.62 if suspicious else 0.18
