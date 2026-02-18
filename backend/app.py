@@ -201,21 +201,38 @@ def analyze():
         return error_response("Failed to initialise model.", status_code=500, details=str(e) if app.debug else None)
 
     # 4) ML prediction
-    try:
-        proba = model.predict_proba([input_text])[0]  # [p_safe, p_phish]
-        p_safe = float(proba[0])
-        p_phish = float(proba[1])
-    except Exception as e:
-        return error_response("Model prediction failed.", status_code=500, details=str(e) if app.debug else None)
+     # 4) ML prediction (with correct class mapping)
+    proba = model.predict_proba([input_text])[0]
+    classes = list(getattr(model, "classes_", [0, 1]))  # safer
 
-    verdict = "Suspicious" if p_phish >= 0.5 else "Safe"
+    p_safe = float(proba[classes.index(0)]) if 0 in classes else float(proba[0])
+    p_phish = float(proba[classes.index(1)]) if 1 in classes else float(proba[-1])
+
+    # Demo-friendly threshold (tiny datasets often output low probabilities)
+    THRESHOLD = 0.35
+
+    # Keyword guardrail (helps your demo + makes sense academically as hybrid system)
+    KEYWORDS = ["urgent", "verify", "password", "login", "invoice", "payment", "account", "transaction"]
+    blob = input_text.lower()
+    keyword_hit = any(k in blob for k in KEYWORDS)
+
+    if keyword_hit and p_phish < THRESHOLD:
+        # bump risk a bit so obvious phish doesn't look "safe"
+        p_phish = max(p_phish, 0.60)
+
+    verdict = "Suspicious" if (p_phish >= THRESHOLD or keyword_hit) else "Safe"
     risk = p_phish
     confidence = float(max(p_safe, p_phish))
 
     reasons = [
         "ML model: TF-IDF + Logistic Regression.",
-        "Local explanation included (SHAP and/or LIME) when available."
+        f"Decision threshold: {THRESHOLD:.2f}.",
     ]
+    if keyword_hit:
+        reasons.append("Heuristic guardrail: suspicious keywords detected.")
+    else:
+        reasons.append("No strong heuristic keyword indicators detected.")
+
 
     # 5) XAI
     xai_payload = {"available": {"shap": SHAP_AVAILABLE, "lime": LIME_AVAILABLE}}

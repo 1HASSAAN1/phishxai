@@ -135,6 +135,7 @@
 </template>
 
 <script setup>
+
 import { computed, ref } from "vue";
 
 const channel = ref("email");
@@ -163,7 +164,6 @@ const verdictClass = computed(() => {
 });
 
 const hasXai = computed(() => !!data.value?.xai);
-
 const shapTokens = computed(() => data.value?.xai?.shap_top_tokens || []);
 const limeTokens = computed(() => data.value?.xai?.lime_top_tokens || []);
 
@@ -171,7 +171,6 @@ function fmt(x) {
   if (x === null || x === undefined) return "-";
   const n = Number(x);
   if (Number.isNaN(n)) return String(x);
-  // prettier for demo
   return n.toFixed(4);
 }
 
@@ -192,7 +191,19 @@ async function analyze() {
       body: JSON.stringify(payload),
     });
 
-    const json = await res.json();
+    // Robust parsing: handles HTML error pages too
+    const contentType = res.headers.get("content-type") || "";
+    const bodyText = await res.text();
+
+    let json;
+    if (contentType.includes("application/json")) {
+      json = JSON.parse(bodyText);
+    } else {
+      throw new Error(
+        `Backend returned non-JSON (status ${res.status}). ` + bodyText.slice(0, 300)
+      );
+    }
+
     if (!res.ok) throw new Error(json.error || "Request failed");
     data.value = json;
   } catch (e) {
@@ -206,7 +217,6 @@ async function copyJson() {
   try {
     await navigator.clipboard.writeText(JSON.stringify(data.value, null, 2));
   } catch {
-    // fallback
     const el = document.createElement("textarea");
     el.value = JSON.stringify(data.value, null, 2);
     document.body.appendChild(el);
@@ -215,6 +225,8 @@ async function copyJson() {
     document.body.removeChild(el);
   }
 }
+
+
 </script>
 
 <style>
