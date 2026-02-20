@@ -209,7 +209,7 @@ def analyze():
     p_phish = float(proba[classes.index(1)]) if 1 in classes else float(proba[-1])
 
     # Demo-friendly threshold (tiny datasets often output low probabilities)
-    THRESHOLD = 0.35
+    THRESHOLD = 0.15
 
     # Keyword guardrail (helps your demo + makes sense academically as hybrid system)
     KEYWORDS = ["urgent", "verify", "password", "login", "invoice", "payment", "account", "transaction"]
@@ -218,7 +218,7 @@ def analyze():
 
     if keyword_hit and p_phish < THRESHOLD:
         # bump risk a bit so obvious phish doesn't look "safe"
-        p_phish = max(p_phish, 0.60)
+        p_phish = max(p_phish, 0.40)
 
     verdict = "Suspicious" if (p_phish >= THRESHOLD or keyword_hit) else "Safe"
     risk = p_phish

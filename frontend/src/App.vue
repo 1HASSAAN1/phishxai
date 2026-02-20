@@ -73,7 +73,7 @@
                 <span class="pill">Top tokens</span>
               </div>
 
-              <ul class="tokenList">
+                  <ul class="tokenList">
                 <li v-for="(t, i) in shapTokens" :key="'s'+i" class="tokenRow">
                   <span class="token">{{ t.token }}</span>
                   <span class="score">{{ fmt(t.contribution) }}</span>
@@ -136,6 +136,7 @@
 
 <script setup>
 
+
 import { computed, ref } from "vue";
 
 const channel = ref("email");
@@ -191,19 +192,14 @@ async function analyze() {
       body: JSON.stringify(payload),
     });
 
-    // Robust parsing: handles HTML error pages too
     const contentType = res.headers.get("content-type") || "";
     const bodyText = await res.text();
 
-    let json;
-    if (contentType.includes("application/json")) {
-      json = JSON.parse(bodyText);
-    } else {
-      throw new Error(
-        `Backend returned non-JSON (status ${res.status}). ` + bodyText.slice(0, 300)
-      );
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Backend returned non-JSON (status ${res.status}). ${bodyText.slice(0, 300)}`);
     }
 
+    const json = JSON.parse(bodyText);
     if (!res.ok) throw new Error(json.error || "Request failed");
     data.value = json;
   } catch (e) {
@@ -214,18 +210,9 @@ async function analyze() {
 }
 
 async function copyJson() {
-  try {
-    await navigator.clipboard.writeText(JSON.stringify(data.value, null, 2));
-  } catch {
-    const el = document.createElement("textarea");
-    el.value = JSON.stringify(data.value, null, 2);
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand("copy");
-    document.body.removeChild(el);
-  }
+  if (!data.value) return;
+  await navigator.clipboard.writeText(JSON.stringify(data.value, null, 2));
 }
-
 
 </script>
 

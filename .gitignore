@@ -10,3 +10,18 @@ frontend/dist/
 # OS / Editor
 .DS_Store
 .vscode/
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Models
+backend/models/
+*.joblib
+
+# Node
+frontend/node_modules/
+dist/
+
+# Env
+.env
