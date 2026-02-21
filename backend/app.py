@@ -163,10 +163,8 @@ def home():
 def health():
     return jsonify({"ok": True})
 
-
 @app.post("/api/analyze")
 def analyze():
-    # 1) Ensure request is JSON
     if not request.is_json:
         return error_response(
             "Request must be JSON. Set header Content-Type: application/json",
@@ -177,7 +175,6 @@ def analyze():
     if data is None:
         return error_response("Malformed JSON body.", status_code=400)
 
-    # 2) Validate channel
     channel = (data.get("channel") or "").strip().lower()
     if channel not in ALLOWED_CHANNELS:
         return error_response(
@@ -185,6 +182,120 @@ def analyze():
             status_code=400,
             details={"channel": channel}
         )
+
+    text = data.get("text")
+    url = data.get("url")
+
+    try:
+        ensure_model_loaded()
+        input_text, clean_text, clean_url = normalize_input(channel, text, url)
+    except FileNotFoundError as e:
+        return error_response(str(e), status_code=500)
+    except ValueError as e:
+        return error_response(str(e), status_code=400)
+    except Exception as e:
+        return error_response(
+            "Failed to initialise model.",
+            status_code=500,
+            details=str(e) if app.debug else None
+        )
+
+    # -----------------------------
+    # 1) ML prediction (robust mapping)
+    # -----------------------------
+    proba = model.predict_proba([input_text])[0]
+    classes = list(getattr(model, "classes_", [0, 1]))
+
+    # Map probas to {safe, phish} even if classes order is weird
+    if 0 in classes and 1 in classes:
+        p_safe = float(proba[classes.index(0)])
+        p_phish = float(proba[classes.index(1)])
+    else:
+        # fallback: assume binary [safe, phish]
+        p_safe = float(proba[0])
+        p_phish = float(proba[-1])
+
+    # -----------------------------
+    # 2) Sensible 3-tier thresholds
+    # -----------------------------
+    # Tune these later using validation (see train_model snippet below).
+    TH_SAFE = 0.35        # below this => Safe
+    TH_PHISH = 0.70       # above this => Phish
+    # between => Suspicious
+
+    # -----------------------------
+    # 3) Heuristic guardrail (ONLY nudges borderline cases)
+    # -----------------------------
+    KEYWORDS = [
+        "urgent", "verify", "password", "login", "invoice", "payment",
+        "account", "transaction", "security alert", "confirm", "suspended"
+    ]
+    blob = input_text.lower()
+    keyword_hit = any(k in blob for k in KEYWORDS)
+
+    # If keywords exist but model is *borderline safe*, bump into suspicious only.
+    # This avoids "everything is sus" while still catching obvious phishy language.
+    if keyword_hit and p_phish < TH_SAFE:
+        p_phish = max(p_phish, TH_SAFE + 0.01)
+
+    # Optional: URL channel tends to be harsher (short text, lots of tokens).
+    # Slightly lower safe threshold for URLs only:
+    th_safe = TH_SAFE - 0.05 if channel == "url" else TH_SAFE
+    th_phish = TH_PHISH
+
+    # -----------------------------
+    # 4) Final verdict
+    # -----------------------------
+    if p_phish >= th_phish:
+        verdict = "Phish"
+    elif p_phish >= th_safe:
+        verdict = "Suspicious"
+    else:
+        verdict = "Safe"
+
+    risk = float(p_phish)
+    confidence = float(max(p_safe, p_phish))
+
+    reasons = [
+        "ML model: TF-IDF + Logistic Regression.",
+        f"Thresholds: Safe<{th_safe:.2f}, Phish>={th_phish:.2f}.",
+    ]
+    if keyword_hit:
+        reasons.append("Heuristic guardrail: suspicious keywords detected (used as a nudge).")
+
+    # -----------------------------
+    # 5) XAI (same as yours)
+    # -----------------------------
+    xai_payload = {"available": {"shap": SHAP_AVAILABLE, "lime": LIME_AVAILABLE}}
+    try:
+        shap_top = shap_explain_text(input_text, max_terms=8)
+        lime_top = lime_explain_text(input_text, max_terms=8)
+
+        if shap_top is not None:
+            xai_payload["shap_top_tokens"] = shap_top
+        if lime_top is not None:
+            xai_payload["lime_top_tokens"] = lime_top
+    except Exception as e:
+        xai_payload["warning"] = "XAI generation failed."
+        if app.debug:
+            xai_payload["details"] = str(e)
+
+    return jsonify({
+        "ok": True,
+        "channel": channel,
+        "input": {
+            "text": clean_text if channel != "url" else None,
+            "url": clean_url if channel == "url" else None
+        },
+        "result": {
+            "verdict": verdict,
+            "risk": risk,
+            "confidence": confidence,
+            "probabilities": {"safe": p_safe, "phish": p_phish},
+            "reasons": reasons
+        },
+        "xai": xai_payload
+    })
 
     # 3) Validate content
     text = data.get("text")

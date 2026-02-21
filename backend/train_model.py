@@ -1,105 +1,132 @@
 import os
-import re
+import json
 import joblib
+import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.feature_extraction.text import HashingVectorizer
-from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import precision_recall_curve, classification_report, confusion_matrix
 
 
 # -----------------------------
-# CONFIG (match your Kaggle file)
+# CONFIG
 # -----------------------------
-DATA_PATH = os.path.join("data", "Phishing_Email.csv")   # put Kaggle file here
+DATA_PATH = os.path.join("data", "phish_dataset.csv")
 MODEL_DIR = "models"
-MODEL_PATH = os.path.join(MODEL_DIR, "phish_hash_sgd.joblib")
+MODEL_PATH = os.path.join(MODEL_DIR, "phish_model.joblib")
+META_PATH  = os.path.join(MODEL_DIR, "phish_meta.json")
 
-TEXT_COL = "Email Text"
-LABEL_COL = "Email Type"
-
-# Optional: cap super long emails (prevents one giant email blowing RAM/time)
-MAX_CHARS = 20000
+TEXT_COL = "text"
+LABEL_COL = "label"   # 0 = safe, 1 = phish
 
 
-def clean_text(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s[:MAX_CHARS]
-    s = s.replace("\x00", " ")
-    # collapse whitespace
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def choose_threshold(y_true, p_phish, target_precision=0.95):
+    """
+    Choose the LOWEST threshold that achieves at least target_precision,
+    so we reduce false positives (normal msgs flagged as sus/phish).
+    Falls back to 0.5 if target precision can't be reached.
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, p_phish)
+    # thresholds has length = len(precisions)-1
+    best = None
+    for i, t in enumerate(thresholds):
+        prec = precisions[i + 1]
+        rec = recalls[i + 1]
+        if prec >= target_precision:
+            best = (t, prec, rec)
+            break
 
+    if best is None:
+        return 0.5, float(precisions[-1]), float(recalls[-1])
 
-def label_to_int(x: str) -> int:
-    x = str(x).strip().lower()
-    # dataset uses "Safe Email" vs "Phishing Email"
-    if "phish" in x:
-        return 1
-    return 0
+    t, prec, rec = best
+    return float(t), float(prec), float(rec)
 
 
 def main():
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(
-            f"Dataset not found at {DATA_PATH}.\n"
-            f"Put your Kaggle file here: backend/data/Phishing_Email.csv"
+            f"Dataset not found at {DATA_PATH}. Expected columns '{TEXT_COL}' and '{LABEL_COL}'."
         )
 
     df = pd.read_csv(DATA_PATH)
 
     if TEXT_COL not in df.columns or LABEL_COL not in df.columns:
-        raise ValueError(
-            f"CSV must contain columns '{TEXT_COL}' and '{LABEL_COL}'. "
-            f"Found: {list(df.columns)}"
-        )
+        raise ValueError(f"CSV must contain columns: '{TEXT_COL}' and '{LABEL_COL}'. Found: {list(df.columns)}")
 
-    # Drop missing rows safely
-    df = df.dropna(subset=[TEXT_COL, LABEL_COL]).copy()
+    X = df[TEXT_COL].astype(str).fillna("")
+    y = df[LABEL_COL].astype(int).values
 
-    X = df[TEXT_COL].map(clean_text)
-    y = df[LABEL_COL].map(label_to_int).astype(int)
-
-    # train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    # Split: train / temp
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
+    )
+    # Split temp: val / test
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
     )
 
-    # Memory-safe pipeline (no vocabulary stored)
-    pipe = Pipeline([
-        ("vec", HashingVectorizer(
+    # Base pipeline
+    base_pipe = Pipeline([
+        ("tfidf", TfidfVectorizer(
             lowercase=True,
             stop_words="english",
             ngram_range=(1, 2),
-            alternate_sign=False,   # important for linear models stability
-            n_features=2**18,       # 262k features (safe); can try 2**17 if needed
-            norm="l2"
+            max_features=50000,
+            min_df=2  # helps reduce weird one-off tokens
         )),
-        ("clf", SGDClassifier(
-            loss="log_loss",        # logistic regression equivalent
-            alpha=1e-5,
+        ("clf", LogisticRegression(
             max_iter=2000,
-            tol=1e-3,
             class_weight="balanced",
-            random_state=42
+            solver="lbfgs"
         ))
     ])
 
-    pipe.fit(X_train, y_train)
-    preds = pipe.predict(X_test)
+    # Fit base model
+    base_pipe.fit(X_train, y_train)
 
-    print("\n=== Classification Report ===")
-    print(classification_report(y_test, preds, digits=4))
+    # Calibrate probabilities (very important!)
+    # NOTE: needs an estimator that can be refit; easiest is to calibrate the whole pipeline.
+    calib = CalibratedClassifierCV(base_pipe, method="sigmoid", cv=3)
+    calib.fit(X_train, y_train)
 
-    print("\n=== Confusion Matrix ===")
-    print(confusion_matrix(y_test, preds))
+    # Find threshold that reduces false positives
+    p_val = calib.predict_proba(X_val)[:, 1]
+    phish_threshold, prec, rec = choose_threshold(y_val, p_val, target_precision=0.95)
 
+    # Also define a "suspicious" band below the phish threshold
+    suspicious_threshold = max(0.30, phish_threshold - 0.15)
+
+    # Evaluate on test
+    p_test = calib.predict_proba(X_test)[:, 1]
+    y_pred_test = (p_test >= phish_threshold).astype(int)
+
+    print("\n=== TEST (Phish threshold) ===")
+    print(f"Chosen phish_threshold: {phish_threshold:.4f}  (val precision≈{prec:.3f}, recall≈{rec:.3f})")
+    print(classification_report(y_test, y_pred_test, digits=4))
+    print("Confusion matrix:\n", confusion_matrix(y_test, y_pred_test))
+
+    # Save model + metadata
     os.makedirs(MODEL_DIR, exist_ok=True)
-    joblib.dump(pipe, MODEL_PATH)
+    joblib.dump(calib, MODEL_PATH)
+
+    meta = {
+        "text_col": TEXT_COL,
+        "label_col": LABEL_COL,
+        "thresholds": {
+            "suspicious": float(suspicious_threshold),
+            "phish": float(phish_threshold),
+        }
+    }
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
     print(f"\n✅ Saved model -> {MODEL_PATH}")
+    print(f"✅ Saved meta  -> {META_PATH}")
 
 
 if __name__ == "__main__":
