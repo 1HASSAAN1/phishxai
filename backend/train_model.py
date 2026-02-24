@@ -26,28 +26,35 @@ LABEL_COL = "label"   # 0 = safe, 1 = phish
 
 def choose_threshold(y_true, p_phish, target_precision=0.95):
     """
-    Choose the LOWEST threshold that achieves at least target_precision,
-    so we reduce false positives (normal msgs flagged as sus/phish).
+    Choose a threshold that achieves at least target_precision.
+    Among all thresholds meeting precision, pick the one with the HIGHEST recall
+    (usually best tradeoff when you're prioritizing few false positives but still want coverage).
+
     Falls back to 0.5 if target precision can't be reached.
     """
     precisions, recalls, thresholds = precision_recall_curve(y_true, p_phish)
-    # thresholds has length = len(precisions)-1
-    best = None
+    # thresholds length = len(precisions) - 1
+    # precisions/recalls align such that precisions[i+1], recalls[i+1] correspond to thresholds[i]
+    valid = []
     for i, t in enumerate(thresholds):
         prec = precisions[i + 1]
         rec = recalls[i + 1]
         if prec >= target_precision:
-            best = (t, prec, rec)
-            break
+            valid.append((t, prec, rec))
 
-    if best is None:
+    if not valid:
+        # report the best precision you actually got at the strictest threshold
         return 0.5, float(precisions[-1]), float(recalls[-1])
 
-    t, prec, rec = best
+    # pick the one with maximum recall; if tie, pick the smaller threshold
+    valid.sort(key=lambda x: (-x[2], x[0]))
+    t, prec, rec = valid[0]
     return float(t), float(prec), float(rec)
 
 
 def main():
+    np.random.seed(42)
+
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(
             f"Dataset not found at {DATA_PATH}. Expected columns '{TEXT_COL}' and '{LABEL_COL}'."
@@ -56,28 +63,30 @@ def main():
     df = pd.read_csv(DATA_PATH)
 
     if TEXT_COL not in df.columns or LABEL_COL not in df.columns:
-        raise ValueError(f"CSV must contain columns: '{TEXT_COL}' and '{LABEL_COL}'. Found: {list(df.columns)}")
+        raise ValueError(
+            f"CSV must contain columns: '{TEXT_COL}' and '{LABEL_COL}'. Found: {list(df.columns)}"
+        )
 
     X = df[TEXT_COL].astype(str).fillna("")
     y = df[LABEL_COL].astype(int).values
 
     # Split: train / temp
     X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
+        X, y, test_size=0.30, random_state=42, stratify=y
     )
     # Split temp: val / test
     X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
+        X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp
     )
 
-    # Base pipeline
+    # Base pipeline (do NOT fit here; calibration will fit)
     base_pipe = Pipeline([
         ("tfidf", TfidfVectorizer(
             lowercase=True,
             stop_words="english",
             ngram_range=(1, 2),
             max_features=50000,
-            min_df=2  # helps reduce weird one-off tokens
+            min_df=2
         )),
         ("clf", LogisticRegression(
             max_iter=2000,
@@ -86,29 +95,29 @@ def main():
         ))
     ])
 
-    # Fit base model
-    base_pipe.fit(X_train, y_train)
-
-    # Calibrate probabilities (very important!)
-    # NOTE: needs an estimator that can be refit; easiest is to calibrate the whole pipeline.
+    # Calibrate probabilities
     calib = CalibratedClassifierCV(base_pipe, method="sigmoid", cv=3)
     calib.fit(X_train, y_train)
 
-    # Find threshold that reduces false positives
+    # Choose threshold on validation to reduce false positives
     p_val = calib.predict_proba(X_val)[:, 1]
-    phish_threshold, prec, rec = choose_threshold(y_val, p_val, target_precision=0.95)
+    phish_threshold, val_prec, val_rec = choose_threshold(y_val, p_val, target_precision=0.95)
 
-    # Also define a "suspicious" band below the phish threshold
-    suspicious_threshold = max(0.30, phish_threshold - 0.15)
+    # Suspicious band: below phish threshold, never above it
+    suspicious_threshold = phish_threshold - 0.15
+    suspicious_threshold = max(0.30, suspicious_threshold)
+    suspicious_threshold = min(suspicious_threshold, phish_threshold)
 
-    # Evaluate on test
+    # Evaluate on test using phish threshold
     p_test = calib.predict_proba(X_test)[:, 1]
     y_pred_test = (p_test >= phish_threshold).astype(int)
 
+    cm = confusion_matrix(y_test, y_pred_test)
+
     print("\n=== TEST (Phish threshold) ===")
-    print(f"Chosen phish_threshold: {phish_threshold:.4f}  (val precision≈{prec:.3f}, recall≈{rec:.3f})")
+    print(f"Chosen phish_threshold: {phish_threshold:.4f}  (val precision≈{val_prec:.3f}, recall≈{val_rec:.3f})")
     print(classification_report(y_test, y_pred_test, digits=4))
-    print("Confusion matrix:\n", confusion_matrix(y_test, y_pred_test))
+    print("Confusion matrix:\n", cm)
 
     # Save model + metadata
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -117,11 +126,25 @@ def main():
     meta = {
         "text_col": TEXT_COL,
         "label_col": LABEL_COL,
+        "dataset": {
+            "n_rows": int(len(df)),
+            "class_balance": {
+                "safe": int((y == 0).sum()),
+                "phish": int((y == 1).sum())
+            }
+        },
         "thresholds": {
             "suspicious": float(suspicious_threshold),
             "phish": float(phish_threshold),
-        }
+        },
+        "validation_at_phish_threshold": {
+            "target_precision": 0.95,
+            "precision": float(val_prec),
+            "recall": float(val_rec),
+        },
+        "test_confusion_matrix": cm.tolist()
     }
+
     with open(META_PATH, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
